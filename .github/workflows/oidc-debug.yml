@@ -60,6 +60,7 @@ jobs:
         with:
           oidc-provider-name: ${{ env.OIDC_PROVIDER }}
           oidc-audience: ${{ env.OIDC_AUDIENCE }}
+          disable-auto-build-publish: true   # ← add this
 
       - name: "2.5 · Verify JFrog CLI configuration"
         run: |
@@ -76,28 +77,34 @@ jobs:
       - name: "3 · Decode JFrog access token (resolved principal)"
         run: |
           echo "::group::JFrog access token claims (post-exchange resolved subject)"
+          python3 - <<'PYEOF'
+          import json, glob, os, base64
 
-          if [ -z "$JFROG_CLI_ACCESS_TOKEN" ]; then
-            echo "⚠  JFROG_CLI_ACCESS_TOKEN not set — exchange may have failed"
-            CONFIG=$(find ~/.jfrog -name "*.conf*" 2>/dev/null | head -1)
-            [ -n "$CONFIG" ] && echo "Config file: $CONFIG" && cat "$CONFIG" | jq .
-          else
-            echo "✓  Exchange succeeded"
-            PAYLOAD=$(RAW_JWT="$JFROG_CLI_ACCESS_TOKEN" python3 -c "
-          import os, base64, json
-          raw = os.environ['RAW_JWT']
-          part = raw.split('.')[1]
+          conf_files = sorted(glob.glob(os.path.expanduser('~/.jfrog/jfrog-cli.conf*')))
+          if not conf_files:
+              print('No config file found'); exit()
+
+          with open(conf_files[-1]) as f:
+              conf = json.load(f)
+
+          servers = conf.get('servers', [])
+          if not servers:
+              print('No servers in config'); exit()
+
+          token = servers[0].get('accessToken', '')
+          if not token:
+              print('No accessToken in config'); exit()
+
+          # Decode payload only — never print the raw token
+          part = token.split('.')[1]
           pad = 4 - len(part) % 4
-          print(json.dumps(json.loads(base64.urlsafe_b64decode(part + '=' * (pad % 4))), indent=2))
-          ")
-            echo "$PAYLOAD" | jq .
-            echo ""
-            echo "Key fields:"
-            for field in sub scp scope ext iss exp; do
-              val=$(echo "$PAYLOAD" | jq -r --arg f "$field" '.[$f] // "(not present)"')
-              printf "  %-10s %s\n" "$field:" "$val"
-            done
-          fi
+          payload = json.loads(base64.urlsafe_b64decode(part + '=' * (pad % 4)))
+          print(json.dumps(payload, indent=2))
+
+          print("\nKey fields:")
+          for f in ['sub', 'scp', 'scope', 'ext', 'exp']:
+              print(f"  {f:<10} {payload.get(f, '(not present)')}")
+          PYEOF
           echo "::endgroup::"
 
       # ── 4. Effective identity ─────────────────────────────────────
@@ -114,17 +121,31 @@ jobs:
           echo ""
 
           echo "--- /access/api/v1/users/me ---"
-          curl -fsSL \
-            -H "Authorization: Bearer $JFROG_CLI_ACCESS_TOKEN" \
-            "${JF_URL}/access/api/v1/users/me" | jq . \
-            || echo "(unavailable or token not set)"
+          python3 - <<'PYEOF'
+          import json, glob, os
+          import urllib.request, urllib.error
 
-          echo ""
-          echo "--- /access/api/v1/users/me/groups ---"
-          curl -fsSL \
-            -H "Authorization: Bearer $JFROG_CLI_ACCESS_TOKEN" \
-            "${JF_URL}/access/api/v1/users/me/groups" | jq . \
-            || echo "(unavailable)"
+          conf_files = sorted(glob.glob(os.path.expanduser('~/.jfrog/jfrog-cli.conf*')))
+          with open(conf_files[-1]) as f:
+              conf = json.load(f)
+
+          token = conf['servers'][0]['accessToken']
+          base_url = conf['servers'][0]['url'].rstrip('/')
+
+          for path in ['/access/api/v1/users/me']:
+              print(f"GET {base_url}{path}")
+              req = urllib.request.Request(
+                  f"{base_url}{path}",
+                  headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+              )
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      print(json.dumps(json.loads(resp.read()), indent=2))
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP {e.code}: {e.read().decode()}")
+              except Exception as e:
+                  print(f"Error: {e}")
+          PYEOF
 
           echo "::endgroup::"
 
