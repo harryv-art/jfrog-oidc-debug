@@ -55,9 +55,22 @@ jobs:
       # ── 2. OIDC exchange ──────────────────────────────────────────
       - name: "2 · JFrog CLI setup (OIDC exchange)"
         uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
         with:
           oidc-provider-name: ${{ env.OIDC_PROVIDER }}
           oidc-audience: ${{ env.OIDC_AUDIENCE }}
+
+      - name: "2.5 · Verify JFrog CLI configuration"
+        run: |
+          echo "JF_URL value: '${{ vars.JF_URL }}'"
+          echo "JFROG_CLI_ACCESS_TOKEN set: $([ -n "$JFROG_CLI_ACCESS_TOKEN" ] && echo YES || echo NO)"
+          echo ""
+          jf config show
+          if ! jf config show 2>&1 | grep -qi "url"; then
+            echo "::error::No JFrog server configured — check that vars.JF_URL is set and the OIDC provider 'github' exists on harryv1.jfrog.io"
+            exit 1
+          fi
 
       # ── 3. Decoded JFrog token ────────────────────────────────────
       - name: "3 · Decode JFrog access token (resolved principal)"
