@@ -30,33 +30,19 @@ jobs:
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=jfrog-github" | jq -r '.value')
 
-          # Decode JWT payload (base64url, no padding)
-          PAYLOAD=$(python3 - <<'EOF'
-          import sys, base64, json, os, subprocess
-          raw = os.environ.get("_RAW_TOKEN", "")
+          PAYLOAD=$(RAW_JWT="$RAW" python3 -c "
+          import os, base64, json
+          raw = os.environ['RAW_JWT']
           part = raw.split('.')[1]
           pad = 4 - len(part) % 4
-          padded = part + '=' * (pad % 4)
-          decoded = base64.urlsafe_b64decode(padded)
-          print(json.dumps(json.loads(decoded), indent=2))
-          EOF
-          )
-
-          # Workaround: pass RAW via env since heredoc can't read shell vars directly
-          PAYLOAD=$(python3 -c "
-          import sys, base64, json
-          raw = '''$RAW'''
-          part = raw.split('.')[1]
-          pad = 4 - len(part) % 4
-          padded = part + '=' * (pad % 4)
-          print(json.dumps(json.loads(base64.urlsafe_b64decode(padded)), indent=2))
+          print(json.dumps(json.loads(base64.urlsafe_b64decode(part + '=' * (pad % 4))), indent=2))
           ")
 
           echo "Full JWT payload:"
           echo "$PAYLOAD" | jq .
 
           echo ""
-          echo "Claims table (use these field names in JFrog identity mapping rules):"
+          echo "Claims table:"
           printf "  %-35s %s\n" "CLAIM" "VALUE"
           printf "  %-35s %s\n" "─────" "─────"
           for claim in sub iss aud repository repository_id repository_owner \
@@ -66,6 +52,7 @@ jobs:
             val=$(echo "$PAYLOAD" | jq -r --arg c "$claim" '.[$c] // "(not present)"')
             printf "  %-35s %s\n" "$claim" "$val"
           done
+
           echo "::endgroup::"
 
       # ─────────────────────────────────────────────────────────────
