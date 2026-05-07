@@ -1,0 +1,162 @@
+name: "OIDC Debug"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # Required — allows requesting the OIDC token from GitHub
+  contents: read
+
+env:
+  JFROG_CLI_LOG_LEVEL: DEBUG
+
+jobs:
+  oidc-debug:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 1: Decode the raw GitHub OIDC JWT *before* JFrog touches it.
+      # These are the exact claims JFrog evaluates against identity mapping rules.
+      # ─────────────────────────────────────────────────────────────
+      - name: "1 · Dump raw GitHub OIDC JWT claims"
+        run: |
+          echo "::group::GitHub OIDC claims (what JFrog identity mapping rules match against)"
+
+          RAW=$(curl -fsSL \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=jfrog-github" | jq -r '.value')
+
+          # Decode JWT payload (base64url, no padding)
+          PAYLOAD=$(python3 - <<'EOF'
+          import sys, base64, json, os, subprocess
+          raw = os.environ.get("_RAW_TOKEN", "")
+          part = raw.split('.')[1]
+          pad = 4 - len(part) % 4
+          padded = part + '=' * (pad % 4)
+          decoded = base64.urlsafe_b64decode(padded)
+          print(json.dumps(json.loads(decoded), indent=2))
+          EOF
+          )
+
+          # Workaround: pass RAW via env since heredoc can't read shell vars directly
+          PAYLOAD=$(python3 -c "
+          import sys, base64, json
+          raw = '''$RAW'''
+          part = raw.split('.')[1]
+          pad = 4 - len(part) % 4
+          padded = part + '=' * (pad % 4)
+          print(json.dumps(json.loads(base64.urlsafe_b64decode(padded)), indent=2))
+          ")
+
+          echo "Full JWT payload:"
+          echo "$PAYLOAD" | jq .
+
+          echo ""
+          echo "Claims table (use these field names in JFrog identity mapping rules):"
+          printf "  %-35s %s\n" "CLAIM" "VALUE"
+          printf "  %-35s %s\n" "─────" "─────"
+          for claim in sub iss aud repository repository_id repository_owner \
+                       repository_owner_id ref ref_type sha event_name actor \
+                       actor_id workflow workflow_ref workflow_sha \
+                       job_workflow_ref environment runner_environment; do
+            val=$(echo "$PAYLOAD" | jq -r --arg c "$claim" '.[$c] // "(not present)"')
+            printf "  %-35s %s\n" "$claim" "$val"
+          done
+          echo "::endgroup::"
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 2: OIDC exchange via setup-jfrog-cli.
+      # This calls POST /access/api/v1/oidc/token on your JFrog instance.
+      # DEBUG log level will print the exchange request/response.
+      # ─────────────────────────────────────────────────────────────
+      - name: "2 · JFrog CLI setup (OIDC exchange)"
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: ${{ vars.JF_URL }}
+        with:
+          oidc-provider-name: github
+          oidc-audience: jfrog-github
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 3: Decode the JFrog access token that was issued.
+      # sub  → resolved principal (user or service identity)
+      # scp  → effective scope / groups granted
+      # ext  → extended claims (may include identity mapping name used)
+      # ─────────────────────────────────────────────────────────────
+      - name: "3 · Decode JFrog access token (resolved principal post-exchange)"
+        run: |
+          echo "::group::JFrog access token claims"
+
+          if [ -z "$JFROG_CLI_ACCESS_TOKEN" ]; then
+            echo "⚠  JFROG_CLI_ACCESS_TOKEN is not set."
+            echo "   The exchange may have failed, or the token is only in the CLI config file."
+            CONFIG=$(find ~/.jfrog -name "*.conf*" 2>/dev/null | head -1)
+            if [ -n "$CONFIG" ]; then
+              echo "   Config file found: $CONFIG"
+              echo "   Raw config (tokens redacted by CLI):"
+              cat "$CONFIG" | jq 'del(.. | .accessToken? // empty)' 2>/dev/null || cat "$CONFIG"
+            fi
+          else
+            echo "✓  Exchange succeeded — JFROG_CLI_ACCESS_TOKEN is set."
+            echo ""
+
+            PAYLOAD=$(python3 -c "
+          import sys, base64, json
+          raw = '''$JFROG_CLI_ACCESS_TOKEN'''
+          part = raw.split('.')[1]
+          pad = 4 - len(part) % 4
+          padded = part + '=' * (pad % 4)
+          print(json.dumps(json.loads(base64.urlsafe_b64decode(padded)), indent=2))
+          ")
+
+            echo "Full JFrog JWT payload:"
+            echo "$PAYLOAD" | jq .
+
+            echo ""
+            echo "Key fields:"
+            for field in sub scp scope iss exp iat ext jti; do
+              val=$(echo "$PAYLOAD" | jq -r --arg f "$field" '.[$f] // "(not present)"')
+              printf "  %-10s %s\n" "$field:" "$val"
+            done
+          fi
+
+          echo "::endgroup::"
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 4: Platform-level identity check.
+      # ─────────────────────────────────────────────────────────────
+      - name: "4 · Effective identity on the JFrog platform"
+        run: |
+          echo "::group::Effective identity"
+
+          echo "--- Platform ping ---"
+          jf rt curl -X GET "/api/system/ping"
+          echo ""
+
+          echo "--- /access/api/v1/users/me (effective user info) ---"
+          jf rt curl -sS -X GET "/access/api/v1/users/me" | jq . 2>/dev/null || \
+            echo "(endpoint not available on this version)"
+          echo ""
+
+          echo "--- /api/security/currentUser ---"
+          jf rt curl -sS -X GET "/api/security/currentUser" | jq . 2>/dev/null || \
+            echo "(endpoint not available)"
+
+          echo "::endgroup::"
+
+      # ─────────────────────────────────────────────────────────────
+      # STEP 5: Smoke-test an artifact upload with the OIDC token.
+      # Pass = identity mapping is working and permissions are correct.
+      # ─────────────────────────────────────────────────────────────
+      - name: "5 · Artifact upload smoke test"
+        run: |
+          echo "::group::Artifact operation"
+          echo "oidc-probe-$(date -u +%Y%m%dT%H%M%SZ)  run=$GITHUB_RUN_ID" > probe.txt
+          jf rt upload probe.txt oidc-test-local/ --fail-no-op
+          echo ""
+          jf rt search oidc-test-local/probe.txt
+          echo "::endgroup::"
