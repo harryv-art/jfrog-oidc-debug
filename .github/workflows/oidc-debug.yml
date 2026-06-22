@@ -2,6 +2,15 @@ name: OIDC Debug
 
 on:
   workflow_dispatch:
+    inputs:
+      oidc_provider:
+        description: 'OIDC provider name configured in JFrog'
+        required: false
+        default: 'github'
+      oidc_audience:
+        description: 'OIDC audience'
+        required: false
+        default: 'jfrog-github'
   push:
     branches: [main]
 
@@ -15,8 +24,8 @@ jobs:
     env:
       JFROG_CLI_LOG_LEVEL: DEBUG
       JF_URL: ${{ vars.JF_URL }}
-      OIDC_PROVIDER: github
-      OIDC_AUDIENCE: jfrog-github
+      OIDC_PROVIDER: ${{ inputs.oidc_provider || 'github' }}
+      OIDC_AUDIENCE: ${{ inputs.oidc_audience || 'jfrog-github' }}
 
     steps:
 
