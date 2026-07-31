@@ -3,6 +3,10 @@ name: OIDC Debug
 on:
   workflow_dispatch:
     inputs:
+      jfrog_url:
+        description: 'JFrog Platform URL (e.g. https://mycompany.jfrog.io) — leave blank to use the JF_URL repo/org variable instead'
+        required: false
+        default: ''
       oidc_provider:
         description: 'OIDC provider name configured in JFrog'
         required: false
@@ -27,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       JFROG_CLI_LOG_LEVEL: DEBUG
-      JF_URL: ${{ vars.JF_URL }}
+      JF_URL: ${{ inputs.jfrog_url || vars.JF_URL }}
       OIDC_PROVIDER: ${{ inputs.oidc_provider || 'github' }}
       OIDC_AUDIENCE: ${{ inputs.oidc_audience || 'jfrog-github' }}
       PROJECT_KEY: ${{ inputs.project_key || '' }}
@@ -69,8 +73,6 @@ jobs:
       # ── 2. OIDC exchange ──────────────────────────────────────────
       - name: "2 · JFrog CLI setup (OIDC exchange)"
         uses: jfrog/setup-jfrog-cli@v4
-        env:
-          JF_URL: ${{ vars.JF_URL }}
         with:
           oidc-provider-name: ${{ env.OIDC_PROVIDER }}
           oidc-audience: ${{ env.OIDC_AUDIENCE }}
@@ -78,12 +80,12 @@ jobs:
 
       - name: "2.5 · Verify JFrog CLI configuration"
         run: |
-          echo "JF_URL value: '${{ vars.JF_URL }}'"
+          echo "JF_URL value: '$JF_URL'"
           echo "JFROG_CLI_ACCESS_TOKEN set: $([ -n "$JFROG_CLI_ACCESS_TOKEN" ] && echo YES || echo NO)"
           echo ""
           jf config show
           if ! jf config show 2>&1 | grep -qi "url"; then
-            echo "::error::No JFrog server configured — check that vars.JF_URL is set and the OIDC provider 'github' exists on harryv1.jfrog.io"
+            echo "::error::No JFrog server configured — check that vars.JF_URL is set (currently: '$JF_URL') and the OIDC provider '$OIDC_PROVIDER' exists on your JFrog platform"
             exit 1
           fi
 
