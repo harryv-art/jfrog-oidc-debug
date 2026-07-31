@@ -12,9 +12,9 @@ on:
         required: false
         default: 'github'
       oidc_audience:
-        description: 'OIDC audience'
+        description: 'OIDC audience (optional — leave blank to use the default: the URL of the GitHub repository owner)'
         required: false
-        default: 'jfrog-github'
+        default: ''
       project_key:
         description: 'JFrog project key to check roles/members for (optional — only needed if not encoded in the token scope)'
         required: false
@@ -33,7 +33,7 @@ jobs:
       JFROG_CLI_LOG_LEVEL: DEBUG
       JF_URL: ${{ inputs.jfrog_url || vars.JF_URL }}
       OIDC_PROVIDER: ${{ inputs.oidc_provider || 'github' }}
-      OIDC_AUDIENCE: ${{ inputs.oidc_audience || 'jfrog-github' }}
+      OIDC_AUDIENCE: ${{ inputs.oidc_audience || '' }}
       PROJECT_KEY: ${{ inputs.project_key || '' }}
 
     steps:
@@ -43,9 +43,14 @@ jobs:
         run: |
           echo "::group::GitHub OIDC claims (available for JFrog identity mapping rules)"
 
+          ID_TOKEN_URL="$ACTIONS_ID_TOKEN_REQUEST_URL"
+          if [ -n "$OIDC_AUDIENCE" ]; then
+            ID_TOKEN_URL="${ID_TOKEN_URL}&audience=${OIDC_AUDIENCE}"
+          fi
+
           RAW=$(curl -fsSL \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${OIDC_AUDIENCE}" | jq -r '.value')
+            "$ID_TOKEN_URL" | jq -r '.value')
 
           PAYLOAD=$(RAW_JWT="$RAW" python3 -c "
           import os, base64, json
@@ -248,6 +253,18 @@ jobs:
 
               print(f"\n--- Members & assigned roles in project '{project}' ---")
               api_get(f"/access/api/v1/projects/{project}/users")
+
+          # Export so later steps (build-publish/build-scan) can pass --project=$PROJECT_KEY
+          # and write build-info to the project-scoped repo instead of the global one.
+          if project_keys:
+              resolved = sorted(project_keys)[0]
+              if len(project_keys) > 1:
+                  print(f"\nMultiple project keys found ({sorted(project_keys)}) — using '{resolved}' for downstream steps.")
+              github_env = os.environ.get('GITHUB_ENV')
+              if github_env:
+                  with open(github_env, 'a') as f:
+                      f.write(f"PROJECT_KEY={resolved}\n")
+              print(f"\nExported PROJECT_KEY={resolved} for downstream steps")
           PYEOF
           echo "::endgroup::"
 
@@ -259,33 +276,51 @@ jobs:
       - name: "6 · Upload test artifact"
         run: |
           echo "::group::Artifact upload"
+          PROJECT_ARGS=()
+          if [ -n "$PROJECT_KEY" ]; then
+            PROJECT_ARGS=(--project="$PROJECT_KEY")
+          fi
           echo "oidc-probe  run=$GITHUB_RUN_ID  sha=$GITHUB_SHA  $(date -u)" > probe.txt
-          jf rt upload probe.txt oidc-test-local/ --fail-no-op
+          jf rt upload probe.txt oidc-test-local/ --fail-no-op "${PROJECT_ARGS[@]}"
           echo "::endgroup::"
 
       # ── 7. Build-info: collect + publish ─────────────────────────
       # This is the exact sequence that fails in case 413818.
       # JFROG_CLI_BUILD_NAME / BUILD_NUMBER are set by setup-jfrog-cli.
+      # --project is required here: without it, build-publish targets the
+      # global 'artifactory-build-info' repo, which a project-scoped role
+      # (e.g. applied-permissions/roles:<project>:Developer) has no rights on —
+      # it only has rights on the project's own '<project>-build-info' repo.
       - name: "7 · Publish build info"
         run: |
           echo "::group::Build info publish"
           echo "Build name:   $JFROG_CLI_BUILD_NAME"
           echo "Build number: $JFROG_CLI_BUILD_NUMBER"
+          echo "Project key:  ${PROJECT_KEY:-(none — will target the global build-info repo)}"
           echo ""
 
+          PROJECT_ARGS=()
+          if [ -n "$PROJECT_KEY" ]; then
+            PROJECT_ARGS=(--project="$PROJECT_KEY")
+          fi
+
           echo "--- collect env ---"
-          jf rt build-collect-env
+          jf rt build-collect-env "${PROJECT_ARGS[@]}"
 
           echo "--- add git ---"
-          jf rt build-add-git
+          jf rt build-add-git "${PROJECT_ARGS[@]}"
 
           echo "--- build-publish (jf rt bp) ---"
-          jf rt build-publish
+          jf rt build-publish "${PROJECT_ARGS[@]}"
           echo "::endgroup::"
 
       # ── 8. Build scan ─────────────────────────────────────────────
       - name: "8 · Build scan"
         run: |
           echo "::group::Build scan"
-          jf build-scan --fail=false
+          PROJECT_ARGS=()
+          if [ -n "$PROJECT_KEY" ]; then
+            PROJECT_ARGS=(--project="$PROJECT_KEY")
+          fi
+          jf build-scan --fail=false "${PROJECT_ARGS[@]}"
           echo "::endgroup::"
